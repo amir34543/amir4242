@@ -1,19 +1,15 @@
 from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 import re
-import os
 import logging
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SUPPORT_ID = int(os.environ.get("SUPPORT_ID", "0")) #ایدی عددی ادمین
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
-CHANNEL_PRICE = int(os.environ.get("CHANNEL_PRICE", "15000")) #مبلغ ماهنه
-
-if not BOT_TOKEN:
-    raise SystemExit("خطا: متغیر محیطی BOT_TOKEN تنظیم نشده است!")
+BOT_TOKEN = "8266974282:AAEQt54_iNNDtn7Epa13uopIbwpGzLPgvxA"
+SUPPORT_ID = 7845464086
+SUPPORT_USERNAME = "@Aliconfigs"
+CHANNEL_ID = "@SelfPersiangulf"
+CHANNEL_PRICE = 15000 #مبلغ ماهنه 
 
 user_balances = {}
 user_channels = {}
