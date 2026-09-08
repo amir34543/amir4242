@@ -40,7 +40,7 @@ def create_join_keyboard():
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "عضویت در کانال", "url": "https://t.me/emojiperim", "style": "primary"},
+                {"text": "عضویت در کانال", "url": "https://t.me/SelfPersiangulf", "style": "primary"},
                 {"text": "بررسی عضویت", "callback_data": "check_join", "style": "success", "icon_custom_emoji_id": "6258234230396949553"}
             ]
         ]
