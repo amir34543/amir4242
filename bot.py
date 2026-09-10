@@ -3,6 +3,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import re
 import json
 import io
+import asyncio
+import random
+import string
 import httpx
 import logging
 
@@ -29,7 +32,6 @@ def replace_emoji_ids(text):
 # ═══════════════════ پنل ساخت پک ایموجی (فقط ادمین) ═══════════════════
 PACK_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# رجکس سخت‌گیر: فقط «یک» ایموجی کامل (با پشتیبانی ورییشن‌سلکتور، تِن‌اسکین و ZWJ)
 EMOJI_UNIT_RE = re.compile(
     "[\U0001F1E6-\U0001F1FF]{2}"
     "|(?:[\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\u2300-\u23FF\U0001F000-\U0001FAFF]"
@@ -40,10 +42,17 @@ EMOJI_UNIT_RE = re.compile(
 _pack_bot_id = None
 _pack_bot_username = None
 
-async def tg_api(method, payload=None, files=None):
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(f"{PACK_API}/{method}", data=payload, files=files)
-        return resp.json()
+async def tg_api(method, payload=None, files=None, retries=3):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                resp = await client.post(f"{PACK_API}/{method}", data=payload, files=files)
+                return resp.json()
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"{method} ناموفق بعد از {retries} تلاش: {type(last_exc).__name__}: {last_exc}")
 
 def _sanitize(name):
     return re.sub(r"[^A-Za-z0-9_]", "_", name.strip()) or "Pack"
@@ -64,7 +73,6 @@ def _looks_like_ids(text):
     return bool(lines) and all(re.fullmatch(r"\d{5,}(\s*=\s*.+)?", l) for l in lines)
 
 def _norm_emoji(e):
-    """همیشه دقیقاً یک ایموجی معتبر تک‌تایی برمی‌گردونه تا Bot API ارور نده"""
     if isinstance(e, list):
         for item in e:
             if isinstance(item, str):
@@ -85,13 +93,21 @@ def _file_meta(it, key):
     ext = "webp" if it["data"][:4] == b"RIFF" else "png"
     return key, (f"e.{ext}", it["data"], f"image/{ext}")
 
-async def _download_sticker(file_id):
-    res = await tg_api("getFile", {"file_id": file_id})
-    if not res.get("ok"):
-        raise RuntimeError(f"getFile: {res.get('description')}")
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.get(f"{PACK_API}/file/{res['result']['file_path']}")
-        return r.content
+async def _download_sticker(file_id, retries=3):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            res = await tg_api("getFile", {"file_id": file_id})
+            if not res.get("ok"):
+                raise RuntimeError(f"getFile: {res.get('description')}")
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.get(f"{PACK_API}/file/{res['result']['file_path']}")
+                r.raise_for_status()
+                return r.content
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"دانلود فایل ناموفق: {type(last_exc).__name__}: {last_exc}")
 
 async def _fetch_source_items(source_text):
     text = source_text.strip()
@@ -129,13 +145,25 @@ async def _fetch_source_items(source_text):
     } for s in pack["stickers"]]
     return items[:120], pack.get("title") or name
 
+async def _create_set(name, title, stickers_payload, files):
+    res = await tg_api("createNewStickerSet", {
+        "user_id": str(_pack_bot_id),
+        "name": name,
+        "title": (title or "My Emojis")[:64],
+        "sticker_type": "custom_emoji",
+        "stickers": json.dumps(stickers_payload),
+    }, files=files)
+    return res
+
 async def _build_pack(short_name, title, items):
     global _pack_bot_id, _pack_bot_username
     if _pack_bot_id is None:
         me = await tg_api("getMe")
         _pack_bot_id = me["result"]["id"]
         _pack_bot_username = me["result"]["username"]
-    name = f"{_sanitize(short_name)}_by_{_pack_bot_username}"
+
+    base = f"{_sanitize(short_name)}_by_{_pack_bot_username}"
+    name = base
 
     stickers, files = [], {}
     for i, it in enumerate(items[:50]):
@@ -143,17 +171,19 @@ async def _build_pack(short_name, title, items):
         stickers.append({"sticker": f"attach://{k}", "emoji_list": it["emoji"], "format": it["format"]})
         k, f = _file_meta(it, k)
         files[k] = f
-    res = await tg_api("createNewStickerSet", {
-        "user_id": str(_pack_bot_id),
-        "name": name,
-        "title": (title or "My Emojis")[:64],
-        "sticker_type": "custom_emoji",
-        "stickers": json.dumps(stickers),
-    }, files=files)
+
+    res = await _create_set(name, title, stickers, files)
+
+    # اگه اسم قبلاً گرفته شده، پسوند تصادفی بزن و دوباره تلاش کن
+    if not res.get("ok") and "occupied" in str(res.get("description", "")):
+        suffix = "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        name = base[:64 - len(suffix)] + suffix
+        res = await _create_set(name, title, stickers, files)
+
     if not res.get("ok"):
         raise RuntimeError(f"ساخت پک: {res.get('description')}")
 
-    for it in items[50:]:
+    for idx, it in enumerate(items[50:]):
         k, f = _file_meta(it, "s")
         res = await tg_api("addStickerToSet", {
             "user_id": str(_pack_bot_id),
@@ -161,7 +191,7 @@ async def _build_pack(short_name, title, items):
             "sticker": json.dumps({"sticker": "attach://s", "emoji_list": it["emoji"], "format": it["format"]}),
         }, files={"s": f})
         if not res.get("ok"):
-            raise RuntimeError(f"افزودن ایموجی: {res.get('description')}")
+            raise RuntimeError(f"افزودن ایموجی #{idx + 51}: {res.get('description')}")
     return name
 
 async def _pack_report(name):
@@ -899,7 +929,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 full = await _build_pack(short, title, items)
                 pt, rows = await _pack_report(full)
             except Exception as e:
-                await prog.edit_text(f"❌ خطا: {e}\n\nبا /packpanel دوباره تلاش کن.")
+                # لاگ کامل traceback توی Railway + نمایش نوع خطا در تلگرام
+                logging.error("خطای ساخت پک:", exc_info=True)
+                err_text = str(e).strip() if str(e).strip() else type(e).__name__
+                try:
+                    await prog.edit_text(f"❌ خطا: {err_text}\n\nبا /packpanel دوباره تلاش کن.")
+                except:
+                    await update.message.reply_text(f"❌ خطا: {err_text}\n\nبا /packpanel دوباره تلاش کن.")
                 return
             lines = [f"✅ پک <b>{pt}</b> ساخته شد!", f"نام پک: <code>{full}</code>", ""]
             sample = []
