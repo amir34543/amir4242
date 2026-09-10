@@ -1,6 +1,9 @@
 from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 import re
+import json
+import io
+import httpx
 import logging
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
@@ -22,6 +25,164 @@ def replace_emoji_ids(text):
         replacement = f'<tg-emoji emoji-id="{emoji_id}">😎</tg-emoji>'
         new_text = new_text.replace(f'[{emoji_id}]', replacement)
     return new_text
+
+# ═══════════════════ پنل ساخت پک ایموجی (فقط ادمین) ═══════════════════
+PACK_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF\u2B00-\u2BFF\uFE0F\u200D]+"
+)
+_pack_bot_id = None
+_pack_bot_username = None
+
+async def tg_api(method, payload=None, files=None):
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(f"{PACK_API}/{method}", data=payload, files=files)
+        return resp.json()
+
+def _sanitize(name):
+    return re.sub(r"[^A-Za-z0-9_]", "_", name.strip()) or "Pack"
+
+def _extract_pack_name(text):
+    m = re.search(r"(?:addemoji|addstickers)/([A-Za-z0-9_]+)", text)
+    return m.group(1) if m else text.strip()
+
+def _detect_format(s):
+    if s.get("is_animated"):
+        return "animated"
+    if s.get("is_video"):
+        return "video"
+    return "static"
+
+def _looks_like_ids(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return bool(lines) and all(re.fullmatch(r"\d{5,}(\s*=\s*.+)?", l) for l in lines)
+
+def _norm_emoji(e):
+    if isinstance(e, str):
+        f = EMOJI_RE.findall(e)
+        return f or ["😀"]
+    return e or ["😀"]
+
+def _file_meta(it, key):
+    if it["format"] == "video":
+        return key, ("e.webm", it["data"], "video/webm")
+    if it["format"] == "animated":
+        return key, ("e.tgs", it["data"], "application/x-tgz")
+    ext = "webp" if it["data"][:4] == b"RIFF" else "png"
+    return key, (f"e.{ext}", it["data"], f"image/{ext}")
+
+async def _download_sticker(file_id):
+    res = await tg_api("getFile", {"file_id": file_id})
+    if not res.get("ok"):
+        raise RuntimeError(f"getFile: {res.get('description')}")
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.get(f"{PACK_API}/file/{res['result']['file_path']}")
+        return r.content
+
+async def _fetch_source_items(source_text):
+    text = source_text.strip()
+    if _looks_like_ids(text):
+        ids, emoji_map = [], {}
+        for line in text.splitlines():
+            line = line.strip()
+            if "=" in line:
+                eid, emo = line.split("=", 1)
+                eid = eid.strip()
+                ids.append(eid)
+                emoji_map[eid] = _norm_emoji(emo)
+            else:
+                ids.append(line)
+        res = await tg_api("getCustomEmojiStickers", {"custom_emoji_ids": json.dumps(ids)})
+        if not res.get("ok"):
+            raise RuntimeError(f"getCustomEmojiStickers: {res.get('description')}")
+        items = [{
+            "data": await _download_sticker(s["file_id"]),
+            "emoji": emoji_map.get(s.get("custom_emoji_id"), _norm_emoji(s.get("emoji"))),
+            "format": _detect_format(s),
+        } for s in res["result"]]
+        if not items:
+            raise RuntimeError("هیچ ایموجی‌ای پیدا نشد؛ آیدی‌ها رو چک کن")
+        return items[:120], "Emoji Pack"
+    name = _extract_pack_name(text)
+    res = await tg_api("getStickerSet", {"name": name})
+    if not res.get("ok"):
+        raise RuntimeError(f"پک «{name}» پیدا نشد: {res.get('description')}")
+    pack = res["result"]
+    items = [{
+        "data": await _download_sticker(s["file_id"]),
+        "emoji": _norm_emoji(s.get("emoji")),
+        "format": _detect_format(s),
+    } for s in pack["stickers"]]
+    return items[:120], pack.get("title") or name
+
+async def _build_pack(short_name, title, items):
+    global _pack_bot_id, _pack_bot_username
+    if _pack_bot_id is None:
+        me = await tg_api("getMe")
+        _pack_bot_id = me["result"]["id"]
+        _pack_bot_username = me["result"]["username"]
+    name = f"{_sanitize(short_name)}_by_{_pack_bot_username}"
+
+    stickers, files = [], {}
+    for i, it in enumerate(items[:50]):
+        k = f"f{i}"
+        stickers.append({"sticker": f"attach://{k}", "emoji_list": it["emoji"], "format": it["format"]})
+        k, f = _file_meta(it, k)
+        files[k] = f
+    res = await tg_api("createNewStickerSet", {
+        "user_id": str(_pack_bot_id),
+        "name": name,
+        "title": (title or "My Emojis")[:64],
+        "sticker_type": "custom_emoji",
+        "stickers": json.dumps(stickers),
+    }, files=files)
+    if not res.get("ok"):
+        raise RuntimeError(f"ساخت پک: {res.get('description')}")
+
+    for it in items[50:]:
+        k, f = _file_meta(it, "s")
+        res = await tg_api("addStickerToSet", {
+            "user_id": str(_pack_bot_id),
+            "name": name,
+            "sticker": json.dumps({"sticker": "attach://s", "emoji_list": it["emoji"], "format": it["format"]}),
+        }, files={"s": f})
+        if not res.get("ok"):
+            raise RuntimeError(f"افزودن ایموجی: {res.get('description')}")
+    return name
+
+async def _pack_report(name):
+    res = await tg_api("getStickerSet", {"name": name})
+    if not res.get("ok"):
+        raise RuntimeError("خواندن پک جدید ناموفق بود")
+    rows = [("".join(s.get("emoji") or ["😀"]), s["custom_emoji_id"])
+            for s in res["result"]["stickers"] if s.get("custom_emoji_id")]
+    return res["result"].get("title", name), rows
+
+async def pack_panel_start(update, context):
+    context.user_data['waiting_for_pack_name'] = True
+    text = ("🎨 <b>ساخت پک ایموجی</b>\n\n"
+            "۱. یه <b>اسم انگلیسی</b> برای پک بفرست (حروف/عدد/_، بدون فاصله)\n"
+            "مثال: <code>MyEmojis</code>\n\nلغو: /cancel")
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
+        await update.callback_query.answer()
+    else:
+        await update.message.reply_text(text, parse_mode="HTML")
+
+async def pack_panel_cmd(update, context):
+    if update.effective_user.id != SUPPORT_ID:
+        return
+    await pack_panel_start(update, context)
+
+async def cancel_pack_cmd(update, context):
+    if update.effective_user.id != SUPPORT_ID:
+        return
+    had = context.user_data.pop('waiting_for_pack_name', False) or context.user_data.pop('waiting_for_pack_source', False)
+    context.user_data.pop('pack_name', None)
+    if had:
+        await update.message.reply_text("لغو شد ✅", parse_mode="HTML")
+# ═══════════════════ پایان پنل پک ═══════════════════
 
 async def check_user_joined(user_id, context):
     try:
@@ -47,7 +208,7 @@ def create_join_keyboard():
     }
     return InlineKeyboardMarkup.de_json(keyboard, None)
 
-def create_main_keyboard():
+def create_main_keyboard(is_admin=False):
     keyboard = {
         "inline_keyboard": [
             [{"text": "انتخاب کانال", "callback_data": "select_channel", "style": "primary", "icon_custom_emoji_id": "5105062921902229396"}],
@@ -62,6 +223,8 @@ def create_main_keyboard():
             ]
         ]
     }
+    if is_admin:
+        keyboard["inline_keyboard"].append([{"text": "🎨 ساخت پک ایموجی", "callback_data": "packpanel"}])
     return InlineKeyboardMarkup.de_json(keyboard, None)
 
 def create_channel_keyboard(user_id):
@@ -212,7 +375,7 @@ async def show_main_panel(update, context):
         f'<b>با این ربات راحت میتونی ایموجی پرمیوم به کانالت ارسال کنی :) [5104937770850191412]</b>'
     )
     final_text = replace_emoji_ids(welcome_text)
-    reply_markup = create_main_keyboard()
+    reply_markup = create_main_keyboard(user.id == SUPPORT_ID)
     if update.callback_query:
         await update.callback_query.edit_message_text(final_text, parse_mode="HTML", reply_markup=reply_markup)
     else:
@@ -663,6 +826,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_reply_to_user(update, context)
         elif query.data == "back_support":
             await show_support(update, context)
+        elif query.data == "packpanel":
+            if query.from_user.id == SUPPORT_ID:
+                await pack_panel_start(update, context)
         elif query.data == "back_main":
             user = query.from_user
             first_name = user.first_name if user.first_name else user.username if user.username else "کاربر"
@@ -674,7 +840,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             welcome_text = f'<blockquote><b>[5417969813609795944] سلام {first_name} خوش اومدی به ربات ایموجی پرمیوم [5210783786706436474]</b></blockquote>\n\n<b>با این ربات راحت میتونی ایموجی پرمیوم به کانالت ارسال کنی :) [5104937770850191412]</b>'
             final_text = replace_emoji_ids(welcome_text)
-            await query.edit_message_text(final_text, parse_mode="HTML", reply_markup=create_main_keyboard())
+            await query.edit_message_text(final_text, parse_mode="HTML", reply_markup=create_main_keyboard(user.id == SUPPORT_ID))
         elif query.data in ["verify_accept", "verify_reject"]:
             await verify_receipt(update, context)
     except:
@@ -690,6 +856,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 final_text = replace_emoji_ids(join_text)
                 await update.message.reply_text(final_text, parse_mode="HTML", reply_markup=create_join_keyboard(), disable_web_page_preview=True)
                 return
+        # ─── فلوی ساخت پک ایموجی (فقط ادمین) ───
+        if user.id == SUPPORT_ID and context.user_data.get('waiting_for_pack_name'):
+            name = update.message.text.strip()
+            if not re.fullmatch(r"[A-Za-z0-9_]{2,40}", name):
+                await update.message.reply_text("❌ اسم نامعتبره! فقط حروف انگلیسی، عدد و _ — دوباره بفرست:")
+                return
+            context.user_data['pack_name'] = name
+            context.user_data['waiting_for_pack_name'] = False
+            context.user_data['waiting_for_pack_source'] = True
+            await update.message.reply_text(
+                "۲. حالا <b>سورس</b> رو بفرست؛ یکی از دو حالت:\n\n"
+                "🔗 <b>کپی کل پک:</b> لینکش رو بفرست:\n<code>t.me/addemoji/PackName</code>\n\n"
+                "🔢 <b>آیدی دستی:</b> هر خط یه آیدی (ایموجی اختیاری):\n"
+                "<code>5368324170671202286 = 😎</code>",
+                parse_mode="HTML")
+            return
+        if user.id == SUPPORT_ID and context.user_data.get('waiting_for_pack_source'):
+            source = update.message.text.strip()
+            if not (re.search(r"addemoji|addstickers", source) or _looks_like_ids(source)):
+                await update.message.reply_text("❌ فرمت درست نیست!\nیا لینک t.me/addemoji/... بفرست یا لیست آیدی‌ها. (لغو: /cancel)")
+                return
+            context.user_data['waiting_for_pack_source'] = False
+            short = context.user_data.pop('pack_name', 'Pack')
+            prog = await update.message.reply_text("⏳ در حال دانلود فایل‌ها از مبدا...")
+            try:
+                items, title = await _fetch_source_items(source)
+                await prog.edit_text(f"⏳ {len(items)} ایموجی گرفتم؛ دارم پک رو با هویت خود بات می‌سازم...")
+                full = await _build_pack(short, title, items)
+                pt, rows = await _pack_report(full)
+            except Exception as e:
+                await prog.edit_text(f"❌ خطا: {e}\n\nبا /packpanel دوباره تلاش کن.")
+                return
+            lines = [f"✅ پک <b>{pt}</b> ساخته شد!", f"نام پک: <code>{full}</code>", ""]
+            sample = []
+            for emo, eid in rows:
+                lines.append(f"{emo} → <code>{eid}</code>")
+                sample.append(f'<tg-emoji emoji-id="{eid}">{emo}</tg-emoji>')
+            text = "\n".join(lines)
+            if len(text) > 4000:
+                f = io.BytesIO(text.encode())
+                f.name = f"{short}_ids.txt"
+                await update.message.reply_document(f, caption=f"📁 آیدی‌های عددی پک {pt}")
+            else:
+                await update.message.reply_text(text, parse_mode="HTML")
+            for i in range(0, len(sample), 30):
+                try:
+                    await context.bot.send_message(chat_id=SUPPORT_ID,
+                        text="\n".join(sample[i:i + 30]), parse_mode="HTML")
+                except:
+                    pass
+            return
+        # ─── پایان فلوی پک ───
         if context.user_data.get('waiting_for_channel'):
             await handle_channel_registration(update, context)
             return
@@ -751,15 +969,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+async def error_handler(update, context):
+    logging.error("خطا در پردازش آپدیت:", exc_info=context.error)
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", show_help))
-    app.add_handler(CommandHandler("agency", show_agency))
-    app.add_handler(CommandHandler("support", show_support))
+    private = filters.ChatType.PRIVATE  # فقط چت خصوصی؛ پست‌های کانال نادیده گرفته می‌شن
+
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("help", show_help, filters=private))
+    app.add_handler(CommandHandler("agency", show_agency, filters=private))
+    app.add_handler(CommandHandler("support", show_support, filters=private))
+    app.add_handler(CommandHandler("packpanel", pack_panel_cmd, filters=private))
+    app.add_handler(CommandHandler("cancel", cancel_pack_cmd, filters=private))
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO & private, handle_message))
+    app.add_error_handler(error_handler)
     print("start")
     app.run_polling()
 
