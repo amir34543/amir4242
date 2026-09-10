@@ -28,10 +28,15 @@ def replace_emoji_ids(text):
 
 # ═══════════════════ پنل ساخت پک ایموجی (فقط ادمین) ═══════════════════
 PACK_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-EMOJI_RE = re.compile(
-    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF"
-    "\U0001F1E6-\U0001F1FF\u2B00-\u2BFF\uFE0F\u200D]+"
+
+# رجکس سخت‌گیر: فقط «یک» ایموجی کامل (با پشتیبانی ورییشن‌سلکتور، تِن‌اسکین و ZWJ)
+EMOJI_UNIT_RE = re.compile(
+    "[\U0001F1E6-\U0001F1FF]{2}"
+    "|(?:[\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\u2300-\u23FF\U0001F000-\U0001FAFF]"
+    "[\uFE0F]?[\U0001F3FB-\U0001F3FF]?"
+    "(?:\u200D[\u2600-\u27BF\U0001F000-\U0001FAFF][\uFE0F]?[\U0001F3FB-\U0001F3FF]?)*)"
 )
+
 _pack_bot_id = None
 _pack_bot_username = None
 
@@ -59,10 +64,18 @@ def _looks_like_ids(text):
     return bool(lines) and all(re.fullmatch(r"\d{5,}(\s*=\s*.+)?", l) for l in lines)
 
 def _norm_emoji(e):
+    """همیشه دقیقاً یک ایموجی معتبر تک‌تایی برمی‌گردونه تا Bot API ارور نده"""
+    if isinstance(e, list):
+        for item in e:
+            if isinstance(item, str):
+                m = EMOJI_UNIT_RE.search(item)
+                if m:
+                    return [m.group(0)]
+        return ["😀"]
     if isinstance(e, str):
-        f = EMOJI_RE.findall(e)
-        return f or ["😀"]
-    return e or ["😀"]
+        m = EMOJI_UNIT_RE.search(e)
+        return [m.group(0)] if m else ["😀"]
+    return ["😀"]
 
 def _file_meta(it, key):
     if it["format"] == "video":
@@ -974,7 +987,7 @@ async def error_handler(update, context):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    private = filters.ChatType.PRIVATE  # فقط چت خصوصی؛ پست‌های کانال نادیده گرفته می‌شن
+    private = filters.ChatType.PRIVATE
 
     app.add_handler(CommandHandler("start", start, filters=private))
     app.add_handler(CommandHandler("help", show_help, filters=private))
