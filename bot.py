@@ -11,7 +11,8 @@ import logging
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
 
-BOT_TOKEN = "8266974282:AAEQt54_iNNDtn7Epa13uopIbwpGzLPgvxA"
+# توکن بات را مستقیماً اینجا قرار بده
+BOT_TOKEN = "PASTE_YOUR_NEW_BOT_TOKEN_HERE"
 SUPPORT_ID = 7845464086
 SUPPORT_USERNAME = "@Aliconfigs"
 CHANNEL_ID = "@SelfPersiangulf"
@@ -21,13 +22,44 @@ user_balances = {}
 user_channels = {}
 
 def replace_emoji_ids(text):
-    pattern = r'\[(\d+)\]'
-    matches = re.findall(pattern, text)
-    new_text = text
-    for emoji_id in matches:
-        replacement = f'<tg-emoji emoji-id="{emoji_id}">😎</tg-emoji>'
-        new_text = new_text.replace(f'[{emoji_id}]', replacement)
-    return new_text
+    """برای متن‌های داخلی ربات: [CUSTOM_EMOJI_ID] را به تگ HTML تبدیل می‌کند."""
+    def repl(match):
+        emoji_id = match.group(1)
+        # متن داخل تگ فقط fallback است؛ برای پست‌های کاربر تابع async زیر ID را اعتبارسنجی می‌کند.
+        return f'<tg-emoji emoji-id="{emoji_id}">▫️</tg-emoji>'
+    return re.sub(r'\[(\d{5,})\]', repl, text)
+
+async def process_post_emojis(text, context):
+    """Custom Emoji IDهای داخل [ID] را اعتبارسنجی و به HTML تلگرام تبدیل می‌کند."""
+    if not isinstance(text, str):
+        raise ValueError("متن پیام معتبر نیست")
+
+    emoji_ids = list(dict.fromkeys(re.findall(r'\[(\d{5,})\]', text)))
+    if not emoji_ids:
+        return text, []
+
+    try:
+        stickers = await context.bot.get_custom_emoji_stickers(custom_emoji_ids=emoji_ids)
+    except Exception as e:
+        logging.error("خطا در get_custom_emoji_stickers", exc_info=True)
+        raise RuntimeError(f"بررسی آیدی ایموجی ناموفق بود: {e}")
+
+    emoji_map = {
+        str(sticker.custom_emoji_id): (sticker.emoji or "▫️")
+        for sticker in stickers
+        if getattr(sticker, "custom_emoji_id", None)
+    }
+
+    invalid_ids = [eid for eid in emoji_ids if eid not in emoji_map]
+    if invalid_ids:
+        return None, invalid_ids
+
+    def repl(match):
+        eid = match.group(1)
+        fallback = emoji_map[eid]
+        return f'<tg-emoji emoji-id="{eid}">{fallback}</tg-emoji>'
+
+    return re.sub(r'\[(\d{5,})\]', repl, text), []
 
 # ═══════════════════ پنل ساخت پک ایموجی (فقط ادمین) ═══════════════════
 PACK_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -1020,19 +1052,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if context.user_data.get('waiting_for_post'):
             channel = context.user_data.get('selected_channel')
-            if channel:
-                try:
-                    final_text = replace_emoji_ids(update.message.text)
-                    await context.bot.send_message(chat_id=channel, text=final_text, parse_mode="HTML")
-                    confirm_post = f'[5105062921902229396] <b>پیام شما با موفقیت به کانال {channel} ارسال شد!</b>'
-                    final_confirm = replace_emoji_ids(confirm_post)
-                    await update.message.reply_text(final_confirm, parse_mode="HTML")
-                    context.user_data['waiting_for_post'] = False
-                    context.user_data['selected_channel'] = None
-                    await show_select_channel(update, context)
-                except:
-                    await update.message.reply_text("❌ خطا در ارسال پیام به کانال! لطفاً مطمئن شوید ربات در کانال ادمین است.", parse_mode="HTML")
+            user_text = update.message.text or ""
+
+            if not channel:
+                context.user_data['waiting_for_post'] = False
+                await update.message.reply_text("❌ کانال انتخاب‌شده پیدا نشد. دوباره کانال را انتخاب کنید.")
                 return
+
+            if not user_text.strip():
+                await update.message.reply_text("❌ لطفاً متن پست را ارسال کنید.")
+                return
+
+            try:
+                final_text, invalid_ids = await process_post_emojis(user_text, context)
+
+                if invalid_ids:
+                    ids_text = "\n".join(f"• <code>{eid}</code>" for eid in invalid_ids)
+                    await update.message.reply_text(
+                        "❌ این آیدی‌های ایموجی معتبر نیستند یا بات به آن‌ها دسترسی ندارد:\n\n"
+                        f"{ids_text}\n\n"
+                        "فرمت صحیح: <code>سلام [1234567890123456789]</code>",
+                        parse_mode="HTML"
+                    )
+                    return
+
+                await context.bot.send_message(
+                    chat_id=channel,
+                    text=final_text,
+                    parse_mode="HTML"
+                )
+
+                confirm_post = (
+                    f'[5105062921902229396] '
+                    f'<b>پیام شما با موفقیت به کانال {channel} ارسال شد!</b>'
+                )
+                await update.message.reply_text(
+                    replace_emoji_ids(confirm_post),
+                    parse_mode="HTML"
+                )
+
+                context.user_data['waiting_for_post'] = False
+                context.user_data['selected_channel'] = None
+                await show_select_channel(update, context)
+
+            except Exception as e:
+                logging.error("خطا در ارسال پست", exc_info=True)
+                await update.message.reply_text(
+                    "❌ خطا در ارسال پیام به کانال.\n\n"
+                    f"جزئیات: <code>{str(e)[:500]}</code>",
+                    parse_mode="HTML"
+                )
+            return
         if context.user_data.get('waiting_for_receipt'):
             if update.message.photo:
                 await handle_receipt(update, context)
