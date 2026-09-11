@@ -12,7 +12,7 @@ import logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
 
 # توکن بات را مستقیماً اینجا قرار بده
-BOT_TOKEN = "PASTE_YOUR_NEW_BOT_TOKEN_HERE"
+BOT_TOKEN = "8266974282:AAEQt54_iNNDtn7Epa13uopIbwpGzLPgvxA"
 SUPPORT_ID = 7845464086
 SUPPORT_USERNAME = "@Aliconfigs"
 CHANNEL_ID = "@SelfPersiangulf"
