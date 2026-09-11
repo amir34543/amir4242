@@ -61,6 +61,12 @@ async def process_post_emojis(text, context):
 
     return re.sub(r'\[(\d{5,})\]', repl, text), []
 
+
+def contains_custom_emoji_id(text):
+    """آیا متن شامل Custom Emoji ID با فرمت [ID] است؟"""
+    return bool(re.search(r'\[(\d{5,})\]', text or ""))
+
+
 # ═══════════════════ پنل ساخت پک ایموجی (فقط ادمین) ═══════════════════
 PACK_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
@@ -1076,11 +1082,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-                await context.bot.send_message(
-                    chat_id=channel,
-                    text=final_text,
-                    parse_mode="HTML"
-                )
+                # Telegram Bot API در کانال‌ها فقط در صورتی Custom Emoji را بدون
+                # تبدیل به fallback می‌پذیرد که بات شرایط لازم (مثل username خریداری‌شده
+                # و assign شده از طریق Fragment) را داشته باشد. در غیر این صورت ارسال
+                # همان متن باعث نمایش fallback خواهد شد؛ بنابراین از ارسال اشتباه جلوگیری می‌کنیم.
+                try:
+                    await context.bot.send_message(
+                        chat_id=channel,
+                        text=final_text,
+                        parse_mode="HTML"
+                    )
+                except Exception as send_error:
+                    logging.error("Telegram rejected Custom Emoji post", exc_info=True)
+                    raise RuntimeError(
+                        "تلگرام ارسال Custom Emoji در این کانال را برای این بات مجاز نکرده است.\n"
+                        "برای ارسال ایموجی پرمیوم واقعی در کانال باید بات شرایط لازم تلگرام را داشته باشد؛ "
+                        "صرفاً تغییر کد پایتون این محدودیت را دور نمی‌زند.\n\n"
+                        f"خطای Telegram: {send_error}"
+                    )
 
                 confirm_post = (
                     f'[5105062921902229396] '
@@ -1122,16 +1141,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user.id == SUPPORT_ID:
                 await send_admin_reply(update, context)
                 return
-        if user.id == SUPPORT_ID:
-            pattern = r'\[(\d+)\]'
-            matches = re.findall(pattern, update.message.text)
-            if matches:
-                new_text = update.message.text
-                for emoji_id in matches:
-                    replacement = f'<tg-emoji emoji-id="{emoji_id}">😎</tg-emoji>'
-                    new_text = new_text.replace(f'[{emoji_id}]', replacement)
-                await update.message.reply_text(new_text, parse_mode="HTML")
-                return
+        # دیگر ID های ایموجی در این بخش به صورت دستی و با fallback 😎 پردازش نمی‌شوند.
+        # پردازش Custom Emoji فقط در مسیر اختصاصی process_post_emojis انجام می‌شود.
         if update.message.text and update.message.text.startswith('/help'):
             await show_help(update, context)
             return
